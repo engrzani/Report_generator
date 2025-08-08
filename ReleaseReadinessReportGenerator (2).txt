@@ -1,0 +1,354 @@
+Set-StrictMode -Version Latest
+
+function Test-FormExists {
+    return (Get-Variable -Name 'form' -Scope 'Script' -ErrorAction SilentlyContinue) -and ($form -is [System.Windows.Forms.Form])
+}
+
+$global:GlobalErrorLog = Join-Path $env:TEMP "ReleaseReadinessReportGenerator_Error.log"
+$script:settingsFilePath = Join-Path $env:LOCALAPPDATA "ReleaseReadinessReportGenerator\settings.json"
+$script:DefaultOutputFolder = Join-Path $env:LOCALAPPDATA "ReleaseReadinessReportGenerator\Output"
+$script:LogPath = Join-Path $env:LOCALAPPDATA "ReleaseReadinessReportGenerator\logs\debug.log"
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Management.Automation
+
+trap {
+    $ex = $_.Exception
+    if ($ex.GetType().FullName -eq 'System.Management.Automation.StopUpstreamCommandsException') {
+        throw
+    }
+    $details = @"
+Timestamp: $(Get-Date -Format 'u')
+Exception: $ex
+StackTrace: $($_.ScriptStackTrace)
+"@
+    Add-Content -Path $global:GlobalErrorLog -Value $details -Encoding UTF8 -ErrorAction SilentlyContinue
+    if ((Test-FormExists) -and $form.IsHandleCreated) {
+        Show-UIMessage -Message "A critical error occurred. See logs for details: $global:GlobalErrorLog" `
+                      -Title "Critical Error" `
+                      -Icon ([System.Windows.Forms.MessageBoxIcon]::Error)
+    }
+    else {
+        [System.Windows.Forms.MessageBox]::Show(
+            "A critical error occurred. See logs for details: $global:GlobalErrorLog",
+            "Critical Error",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        )
+    }
+    continue
+}
+
+$entryAsm = [System.Reflection.Assembly]::GetEntryAssembly()
+$entryName = if ($entryAsm) { $entryAsm.GetName().Name } else { '' }
+$script:IsCompiledEXE = $entryName -eq 'ReleaseReadinessReportGenerator'
+
+if ($script:IsCompiledEXE) {
+    $scriptRoot = Split-Path -Path ($entryAsm.Location) -Parent
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+    [System.Windows.Forms.Application]::SetCompatibleTextRenderingDefault($false)
+}
+elseif ($PSScriptRoot) {
+    $scriptRoot = $PSScriptRoot
+}
+elseif ($MyInvocation.MyCommand.Path) {
+    $scriptRoot = Split-Path -Path $MyInvocation.MyCommand.Path -Parent
+}
+else {
+    $scriptRoot = Get-Location
+}
+Set-Location -Path $scriptRoot
+
+function Initialize-ComEnvironment {
+    try {
+        [System.Threading.Thread]::CurrentThread.TrySetApartmentState([System.Threading.ApartmentState]::STA) | Out-Null
+        Add-Type -TypeDefinition @"
+            using System;
+            using System.Runtime.InteropServices;
+            public class ComHelper {
+                [DllImport("ole32.dll")]
+                public static extern int CoInitializeEx(IntPtr pvReserved, uint dwCoInit);
+                public const uint COINIT_APARTMENTTHREADED = 0x2;
+                public const uint COINIT_DISABLE_OLE1DDE = 0x4;
+            }
+"@ -ErrorAction SilentlyContinue
+        [ComHelper]::CoInitializeEx([IntPtr]::Zero, [ComHelper]::COINIT_APARTMENTTHREADED -bor [ComHelper]::COINIT_DISABLE_OLE1DDE) | Out-Null
+    } catch {
+        Write-Log "Failed to initialize COM environment: $($_.Exception.Message)"
+    }
+}
+
+Initialize-ComEnvironment
+
+$script:ColumnAliases = @{
+    'Component' = @('Component', 'Module', 'Feature')
+    'Status' = @('Status', 'Requirement Status', 'State')
+    'Owner' = @('Owner', 'Responsible', 'Assignee')
+    'Comments' = @('Comments', 'Notes', 'Remarks')
+    'Target Date' = @('Target Date', 'Due Date', 'Deadline')
+}
+$script:SpecialScenarioSheets = @('SpecialSheet1', 'SpecialSheet2')
+
+function Write-Log {
+    param([string]$Message)
+    try {
+        $logDir = Split-Path $script:LogPath -Parent
+        if (-not (Test-Path $logDir)) {
+            New-Item -Path $logDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        }
+        Add-Content -Path $script:LogPath -Value "$([datetime]::Now.ToString('u')): $Message" -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        # Fallback to temp log if primary log fails
+        Add-Content -Path $global:GlobalErrorLog -Value "$([datetime]::Now.ToString('u')): Log Failure: $($_.Exception.Message)" -Encoding UTF8 -ErrorAction SilentlyContinue
+    }
+}
+
+function Show-UIMessage {
+    param(
+        [string]$Message,
+        [string]$Title = "Notice",
+        [System.Windows.Forms.MessageBoxIcon]$Icon = [System.Windows.Forms.MessageBoxIcon]::Information
+    )
+    if ((Test-FormExists) -and $form.InvokeRequired) {
+        $form.Invoke({
+            param($msg, $title, $icon)
+            [System.Windows.Forms.MessageBox]::Show(
+                $form,
+                $msg,
+                $title,
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                $icon
+            )
+        }, $Message, $Title, $Icon) | Out-Null
+    }
+    else {
+        if (Test-FormExists) {
+            [System.Windows.Forms.MessageBox]::Show(
+                $form,
+                $Message,
+                $Title,
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                $Icon
+            )
+        }
+    }
+}
+
+function Confirm-ImportExcelModule {
+    try {
+        if (Get-Module -ListAvailable -Name ImportExcel) {
+            Import-Module ImportExcel -ErrorAction Stop
+            Write-Log "ImportExcel module loaded successfully from global modules."
+            return
+        }
+        $modulePath = Join-Path $scriptRoot "Modules\ImportExcel\ImportExcel.psd1"
+        if (Test-Path $modulePath) {
+            $absolutePath = [System.IO.Path]::GetFullPath($modulePath)
+            Import-Module $absolutePath -Force -ErrorAction Stop
+            Write-Log "ImportExcel module loaded successfully from $absolutePath."
+        } else {
+            throw "ImportExcel module not found in global modules or local Modules folder"
+        }
+    }
+    catch {
+        $msg = "FATAL: Failed to load the 'ImportExcel' module. Please ensure it is installed or located in the 'Modules' sub-folder. Error: $($_.Exception.Message)"
+        Write-Log $msg
+        Show-UIMessage -Message $msg -Title "Module Load Error" -Icon ([System.Windows.Forms.MessageBoxIcon]::Error)
+        throw
+    }
+}
+
+function Test-FileAccess {
+    param([string]$FilePath)
+    try {
+        $stream = [System.IO.File]::Open($FilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $stream.Close()
+        $stream.Dispose()
+        Write-Log "File access test successful for: $FilePath"
+        return @{ Success = $true }
+    } catch {
+        Write-Log "File access test failed for: $FilePath. Error: $($_.Exception.Message)"
+        return @{ Success = $false; Error = $_.Exception.Message }
+    }
+}
+
+function Test-ValidPath {
+    param([string]$path)
+    $exists = [System.IO.Directory]::Exists($path)
+    Write-Log "Path validation for '$path': $exists"
+    return $exists
+}
+
+function Test-ValidEmailList {
+    param([string[]]$EmailArray)
+    foreach ($email in $EmailArray) {
+        try {
+            [void](New-Object System.Net.Mail.MailAddress($email))
+            if ($email -match '\.{2,}' -or $email -match '@.*@' -or $email -match '^\.' -or $email -match '\.$') {
+                Write-Log "Invalid email format detected (suspicious pattern): $email"
+                return $false
+            }
+            if ($email -match '\.(local|test|invalid|localhost)$') {
+                Write-Log "Invalid email format detected (invalid TLD): $email"
+                return $false
+            }
+        } catch {
+            Write-Log "Invalid email format detected: $email"
+            return $false
+        }
+    }
+    Write-Log "Email list validation successful: $($EmailArray -join ';')"
+    return $true
+}
+
+function Test-ValidDataRow {
+    param($row, [string]$statusCol)
+    $st = $row.$statusCol.ToString().Trim().ToLower()
+    if ($st -in @('complete', 'done', 'closed')) {
+        Write-Log "Row filtered out due to status '$st'"
+        return $false
+    }
+    if (($row.PSObject.Properties.Value -join '') -notmatch '\S') {
+        Write-Log "Row filtered out due to empty data"
+        return $false
+    }
+    Write-Log "Row validated as non-complete and non-empty"
+    return $true
+}
+
+function ConvertTo-SafeHtml {
+    param([string]$inputText)
+    return [System.Net.WebUtility]::HtmlEncode($inputText)
+}
+
+function ConvertTo-SafeDateTime([string]$ds) {
+    if ($ds -is [datetime]) { return $ds }
+    if ($null -eq $ds) { return $null }
+    $s = $ds.ToString().Trim()
+    if ($s -in @('', 'TBD', 'N/A')) { return $null }
+    if ($s -match '^\d+(\.\d+)?$' -and [double]$s -lt 60000) {
+        try { return [datetime]::FromOADate([double]$s) } catch {}
+    }
+    $fmts = @('yyyy-MM-dd', 'M/d/yyyy', 'd/M/yyyy', 'MM/dd/yyyy')
+    foreach ($f in $fmts) {
+        try { return [datetime]::ParseExact($s, $f, $null, [System.Globalization.DateTimeStyles]::None) } catch {}
+    }
+    try { return [datetime]::Parse($s) } catch {}
+    return $null
+}
+
+function Convert-Name($s) { ($s -replace '[\W_]', '').ToLower() }
+
+function Get-FullHtml {
+    param($fragment, $title = "Release Readiness Review Report")
+    return @"
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset='UTF-8'>
+    <title>$(ConvertTo-SafeHtml $title)</title>
+    <style>
+        body, table, td, th { font-family: Georgia, 'Times New Roman', Times, serif; font-size: 11pt; }
+        table { border-collapse: collapse; width: 100%; margin: 10px 0; }
+        th, td { border: 1px solid #333; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; font-weight: bold; }
+        h2 { font-family: Calibri, sans-serif; }
+        .overdue { background-color: #ffcccc; }
+        .due-soon { background-color: #fff2cc; }
+        .upcoming { background-color: #d9ead3; }
+        .escalated { background-color: #ff8888; font-weight: bold; }
+        .footer { font-size: 9pt; font-style: italic; color: #555; }
+    </style>
+</head>
+<body>
+$fragment
+</body>
+</html>
+"@
+}
+
+function Test-OutlookAvailability {
+    $o = $null
+    try {
+        $o = New-Object -ComObject Outlook.Application
+        Write-Log "Outlook is available."
+        return $true
+    } catch {
+        Write-Log "Outlook is not available: $($_.Exception.Message)"
+        return $false
+    } finally {
+        if ($o) {
+            try {
+                [System.Runtime.InteropServices.Marshal]::ReleaseComObject($o) | Out-Null
+            } catch {
+                Write-Log "Warning: Could not release COM object in Test-OutlookAvailability"
+            }
+        }
+    }
+}
+
+function Send-EmailSafely {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$To,
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Subject,
+        [string]$Body,
+        [string]$HTMLBody,
+        [string[]]$Attachments
+    )
+    $olMailItem = 0
+    $olHTML = 2
+    $outlook = $null
+    $mail = $null
+    try {
+        if (-not (Test-OutlookAvailability)) {
+            Write-Log "Microsoft Outlook is not available or not running. Email sending skipped."
+            return
+        }
+        $outlook = New-Object -ComObject Outlook.Application
+        $mail = $outlook.CreateItem($olMailItem)
+        $mail.To = $To -join ";"
+        $mail.Subject = $Subject
+        if ($HTMLBody) {
+            $mail.BodyFormat = $olHTML
+            $mail.HTMLBody = $HTMLBody
+        }
+        else {
+            $mail.Body = $Body
+        }
+        if ($Attachments) {
+            foreach ($att in $Attachments) {
+                if (Test-Path $att) {
+                    $mail.Attachments.Add($att)
+                    Write-Log "Attachment added: $att"
+                }
+                else {
+                    Write-Log "Warning: Attachment not found and not added: $att"
+                }
+            }
+        }
+        Write-Log "Attempting to send email to: $($mail.To)"
+        $mail.Send()
+        Write-Log "Email successfully sent to: $($mail.To)"
+    }
+    catch {
+        Write-Log "Failed to send email. Error: $($_.Exception.Message)"
+        Show-UIMessage -Message "Failed to send email: $($_.Exception.Message)" -Title "Email Error" -Icon Error
+    }
+    finally {
+        if ($null -ne $mail) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($mail) | Out-Null }
+        if ($null -ne $outlook) { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($outlook) | Out-Null }
+    }
+}
+
+function Test-ControlInitialization {
+    param([string]$ControlName, [object]$Control)
+    if ($null -eq $Control) {
+        $errorMsg = "FATAL: GUI Control '$ControlName' is not initialized"
+        Write-Log $errorMsg
+        throw [System.Exception]::new($
