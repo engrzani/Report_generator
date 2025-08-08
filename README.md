@@ -1,3 +1,7 @@
+![WhatsApp Image 2025-08-09 at 03 56 08](https://github.com/user-attachments/assets/5ffb1932-f6b3-4373-ab2c-077d46d149ec)
+![WhatsApp Image 2025-08-09 at 03 56 55](https://github.com/user-attachments/assets/b60c2cfb-df85-42e1-bbd7-2329deae78eb)
+![WhatsApp Image 2025-08-09 at 03 57 16](https://github.com/user-attachments/assets/a1990f52-5033-4ba2-976a-52dded7bb9ed)
+![WhatsApp Image 2025-08-09 at 03 57 36](https://github.com/user-attachments/assets/d8c72f52-bbde-4b12-b0db-4c67854c710f)
 #To check windows powershell 5.1
 $PSVersionTable.PSVersion
 
